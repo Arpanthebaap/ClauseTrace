@@ -1,0 +1,75 @@
+# ClauseTrace — semantic view definition
+# Drafted with CoCo CLI from the raw + analytics schema (docs/coco_cli_playbook.md,
+# "Planning" and "Development" stages: CoCo inferred this structure from
+# sql/001_schema.sql and sql/002_dynamic_tables.sql, then it was reviewed and refined here).
+#
+# This is what makes ClauseTrace's NL -> SQL "governed": every metric and every verified
+# query below is reviewed and named up front, so the Analyst-facing skills can only ask
+# questions the business has already agreed are answerable and well-defined — no ad hoc
+# SQL generated against raw tables.
+
+name: clausetrace_risk_semantic_view
+
+tables:
+  - name: enriched_alerts
+    description: Open and historical AML/fraud alerts enriched with the account's rolling risk profile.
+    primary_key: alert_id
+  - name: account_activity_profile
+    description: Rolling 30-day activity and risk profile per account.
+    primary_key: account_id
+  - name: structuring_signal
+    description: Accounts showing a cluster of sub-threshold cash deposits in a rolling window.
+    primary_key: account_id
+  - name: regulatory_clauses
+    description: Indexed regulatory clause corpus with stable clause_id for citation.
+    primary_key: clause_id
+
+relationships:
+  - from: enriched_alerts.account_id
+    to: account_activity_profile.account_id
+  - from: enriched_alerts.account_id
+    to: structuring_signal.account_id
+
+metrics:
+  - name: open_alert_count
+    table: enriched_alerts
+    expression: "COUNT_IF(status = 'OPEN')"
+    description: Number of currently open alerts.
+  - name: total_cash_deposit_30d
+    table: account_activity_profile
+    expression: "SUM(cash_amount_30d)"
+    description: Total cash deposited across the trailing 30 days.
+  - name: high_risk_open_alert_count
+    table: enriched_alerts
+    expression: "COUNT_IF(status = 'OPEN' AND kyc_risk_rating = 'High')"
+    description: Open alerts on accounts already rated High KYC risk.
+
+# Verified queries: CoCo validates these against real natural-language questions during
+# Testing & Validation (docs/coco_cli_playbook.md) before they are trusted in production.
+verified_queries:
+  - question: "Which accounts have a suspected structuring pattern right now?"
+    sql: |
+      SELECT account_id, cluster_txn_count, cluster_total_amount, cluster_span_hours
+      FROM structuring_signal
+      ORDER BY cluster_total_amount DESC;
+
+  - question: "Show me open high-risk alerts with their supporting cash activity."
+    sql: |
+      SELECT alert_id, account_id, alert_type, total_amount, cash_amount_30d, cross_border_txn_30d
+      FROM enriched_alerts
+      WHERE status = 'OPEN' AND kyc_risk_rating = 'High'
+      ORDER BY total_amount DESC;
+
+  - question: "What clause covers structuring detection?"
+    sql: |
+      SELECT clause_id, source_document, clause_text
+      FROM regulatory_clauses
+      WHERE topic ILIKE '%structuring%' OR topic ILIKE '%suspicious transaction%';
+
+  - question: "How many alerts are open per KYC risk rating?"
+    sql: |
+      SELECT kyc_risk_rating, COUNT(*) AS open_alerts
+      FROM enriched_alerts
+      WHERE status = 'OPEN'
+      GROUP BY kyc_risk_rating
+      ORDER BY open_alerts DESC;
