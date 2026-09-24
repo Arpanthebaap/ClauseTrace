@@ -41,6 +41,31 @@ OBLIGATION_MAP = {
 
 
 @st.cache_data
+def ensure_data():
+    """Auto-generates synthetic data on first run if data/out/ doesn't exist yet.
+    This makes the app self-contained for deployment (Streamlit Community Cloud, etc.)
+    where data/out/ is gitignored and never present in a fresh checkout."""
+    if DATA_DIR.exists() and any(DATA_DIR.glob("*.csv")):
+        return
+    gen_dir = Path(__file__).parent.parent / "data"
+    sys.path.insert(0, str(gen_dir))
+    import generate_synthetic_data as gen
+    import random
+
+    rng = random.Random(42)
+    customers = gen.gen_customers(300, rng)
+    accounts = gen.gen_accounts(customers, rng)
+    customers_by_id = {c.customer_id: c for c in customers}
+    txns, flagged = gen.gen_transactions(accounts, customers_by_id, 90, rng)
+    alerts = gen.gen_alerts(txns, flagged, rng)
+
+    gen.write_csv(DATA_DIR / "customers.csv", [c.__dict__ for c in customers])
+    gen.write_csv(DATA_DIR / "accounts.csv", [a.__dict__ for a in accounts])
+    gen.write_csv(DATA_DIR / "transactions.csv", txns)
+    gen.write_csv(DATA_DIR / "alerts.csv", alerts)
+
+
+@st.cache_data
 def load_data():
     customers = pd.read_csv(DATA_DIR / "customers.csv")
     accounts = pd.read_csv(DATA_DIR / "accounts.csv")
@@ -54,7 +79,7 @@ def load_corpus():
     clauses = []
     for f in CORPUS_DIR.glob("*.md"):
         text = f.read_text(encoding="utf-8")
-        for m in re.finditer(r"## ([\w-]+) \u2014 ([^\n]+)\n(.*?)(?=\n## |\Z)", text, re.DOTALL):
+        for m in re.finditer(r"## ([\w-]+) — ([^\n]+)\n(.*?)(?=\n## |\Z)", text, re.DOTALL):
             clauses.append({
                 "clause_id": m.group(1),
                 "title": m.group(2).strip(),
@@ -73,7 +98,7 @@ def risk_signal_score(alert_row, accounts, transactions, customers) -> tuple[flo
     score, signals, reasons = 0.0, [], []
     if alert_row.alert_type == "STRUCTURING_SUSPECTED":
         score += 0.35; signals.append("structuring_cluster")
-        reasons.append(f"{alert_row.transaction_count} sub-threshold cash deposits totalling \u20b9{alert_row.total_amount:,.0f}")
+        reasons.append(f"{alert_row.transaction_count} sub-threshold cash deposits totalling ₹{alert_row.total_amount:,.0f}")
     if cust.kyc_risk_rating == "High":
         score += 0.20; signals.append("high_kyc_risk"); reasons.append("account holder is rated High KYC risk")
     if bool(cust.pep_flag):
@@ -83,7 +108,7 @@ def risk_signal_score(alert_row, accounts, transactions, customers) -> tuple[flo
         score += 0.15; signals.append("cross_border"); reasons.append(f"{cross_border} cross-border counterparties in the window")
     cash_amt = txns.loc[txns.channel == "Cash Deposit", "amount"].sum()
     if cash_amt > 500000:
-        score += 0.10; signals.append("high_cash_volume"); reasons.append(f"\u20b9{cash_amt:,.0f} in cash deposits (30d)")
+        score += 0.10; signals.append("high_cash_volume"); reasons.append(f"₹{cash_amt:,.0f} in cash deposits (30d)")
 
     score = min(1.0, round(score, 2))
     reason = "; ".join(reasons) if reasons else "No elevated signals beyond the base alert."
@@ -117,26 +142,26 @@ def evidence_and_citation(alert_row, transactions, clauses_df, confidence_base) 
 
 
 def render_finding_packet(alert_row, score, reason, evidence: Evidence, guardrail_result, obligation):
-    st.markdown(f"### Finding Packet \u2014 `{alert_row.alert_id}`")
-    st.caption(f"Account `{alert_row.account_id}` \u00b7 {alert_row.alert_type} \u00b7 status: {alert_row.status}")
+    st.markdown(f"### Finding Packet — `{alert_row.alert_id}`")
+    st.caption(f"Account `{alert_row.account_id}` · {alert_row.alert_type} · status: {alert_row.status}")
 
     badge_color = {"CITED": "green", "DOWNGRADED": "orange", "INSUFFICIENT_EVIDENCE": "red"}[guardrail_result.verdict]
-    st.markdown(f":{badge_color}[**Guardrail verdict: {guardrail_result.verdict}**]  \u00b7  confidence `{evidence.confidence:.2f}`")
+    st.markdown(f":{badge_color}[**Guardrail verdict: {guardrail_result.verdict}**]  ·  confidence `{evidence.confidence:.2f}`")
     st.info(guardrail_result.message)
 
     st.markdown("**1. Risk score**")
-    st.write(f"`{score:.2f}` \u2014 {reason}")
+    st.write(f"`{score:.2f}` — {reason}")
 
-    st.markdown("**2. Evidence \u2014 transaction citations**")
+    st.markdown("**2. Evidence — transaction citations**")
     if evidence.transaction_citations:
         st.dataframe(pd.DataFrame(evidence.transaction_citations), hide_index=True, use_container_width=True)
     else:
         st.warning("No transaction citations retrieved.")
 
-    st.markdown("**3. Evidence \u2014 regulatory clause citations**")
+    st.markdown("**3. Evidence — regulatory clause citations**")
     if evidence.clause_citations:
         for c in evidence.clause_citations:
-            st.markdown(f"> **{c['clause_id']}** \u2014 {c['title']}  \n> {c['text'][:280]}{'...' if len(c['text'])>280 else ''}")
+            st.markdown(f"> **{c['clause_id']}** — {c['title']}  \n> {c['text'][:280]}{'...' if len(c['text'])>280 else ''}")
     else:
         st.warning("No matching regulatory clause retrieved.")
 
@@ -146,7 +171,7 @@ def render_finding_packet(alert_row, score, reason, evidence: Evidence, guardrai
         st.write(f"Required action: {obligation['required_action']}")
         st.write(f"Escalation role: {obligation['escalation_role']}")
     else:
-        st.warning("No mapped obligation for this alert_type \u2014 routed to human compliance review.")
+        st.warning("No mapped obligation for this alert_type — routed to human compliance review.")
 
     st.markdown("**5. Recommendation**")
     if guardrail_result.show_recommendation:
@@ -155,28 +180,28 @@ def render_finding_packet(alert_row, score, reason, evidence: Evidence, guardrai
             f"per {', '.join(obligation['clause_ids']) if obligation else 'manual review'}."
         )
     else:
-        st.error("Recommendation withheld \u2014 see guardrail verdict above.")
+        st.error("Recommendation withheld — see guardrail verdict above.")
 
 
 def main():
-    st.set_page_config(page_title="ClauseTrace", page_icon="\U0001F50E", layout="wide")
-    st.title("\U0001F50E ClauseTrace")
-    st.caption("Evidence-chained Risk, Fraud & Regulatory Intelligence Copilot \u2014 local demo build (synthetic data only)")
+    st.set_page_config(page_title="ClauseTrace", page_icon="🔎", layout="wide")
+    st.title("🔎 ClauseTrace")
+    st.caption("Evidence-chained Risk, Fraud & Regulatory Intelligence Copilot — local demo build (synthetic data only)")
 
     if not DATA_DIR.exists():
-        st.error(f"No synthetic data found at `{DATA_DIR}`. Run `python data/generate_synthetic_data.py` first.")
-        st.stop()
+        with st.spinner("First run: generating synthetic demo data..."):
+            ensure_data()
 
     customers, accounts, transactions, alerts = load_data()
     clauses_df = load_corpus()
 
     with st.sidebar:
         st.header("Alert queue")
-        st.caption(f"{len(alerts)} alerts \u00b7 {(alerts.status=='OPEN').sum()} open")
+        st.caption(f"{len(alerts)} alerts · {(alerts.status=='OPEN').sum()} open")
         alert_id = st.selectbox("Select an alert to investigate", alerts.alert_id.tolist())
         st.divider()
         st.caption("This mirrors the production skill chain:")
-        st.caption("Risk Signal \u2192 Evidence & Citation \u2192 Regulatory Mapping \u2192 Guardrail \u2192 Finding Drafter")
+        st.caption("Risk Signal → Evidence & Citation → Regulatory Mapping → Guardrail → Finding Drafter")
 
     alert_row = alerts[alerts.alert_id == alert_id].iloc[0]
 
@@ -194,7 +219,7 @@ def main():
                        value="Why was this alert flagged?")
     if st.button("Ask"):
         if "clause" in q.lower():
-            st.write(f"Matched clause(s): {', '.join(c['clause_id'] for c in evidence.clause_citations) or 'none \u2014 insufficient evidence'}")
+            st.write(f"Matched clause(s): {', '.join(c['clause_id'] for c in evidence.clause_citations) or 'none — insufficient evidence'}")
         else:
             st.write(f"{reason} (risk score {score:.2f}, guardrail verdict {guardrail_result.verdict})")
         st.caption("In the production build this call is logged to raw.audit_log with the full evidence object.")
